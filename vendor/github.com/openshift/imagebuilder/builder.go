@@ -513,6 +513,17 @@ type Builder struct {
 	// client to handle this field.
 	After string
 
+	// RunIn is the tools image specified with `FROM <baseimg> --run-as=<toolsimg>`.
+	// When set, RUN instructions execute inside the tools image's environment
+	// while the base image's filesystem is pre-populated at RunAt.
+	// The final committed image is derived from RunAt and layered on top
+	// of the positional base image, not the tools image.
+	RunIn string
+	// RunAt is the path inside the tools container where the base image
+	// filesystem is mounted, as specified with `FROM <baseimg> --rootfs=<path>`.
+	// Defaults to "/target" when RunIn is set and no rootfs is specified.
+	RunAt string
+
 	// Overrides for TARGET... and BUILD... values. TARGET... values are
 	// typically only necessary if the builder's target platform is not the
 	// same as the build platform.

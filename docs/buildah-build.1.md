@@ -1578,6 +1578,56 @@ FROM --after=builder oci-archive:fedora.ociarchive
 # This stage will wait for builder to complete before evaluating FROM
 ```
 
+### Using FROM --run-in and --at to separate execution environment from base image
+
+The `--run-in` and `--at` flags on the `FROM` instruction allow `RUN`
+instructions to execute inside a different image than the one the stage is
+based on. This decouples the tools used during the build from the image that
+is ultimately committed.
+
+```
+FROM --run-in=<toolsimg> --at=<path> <baseimg> [AS <name>]
+```
+
+- **baseimg** — the image the stage is based on. The final committed image
+  layers on top of this image and inherits its config (CMD, ENTRYPOINT, ENV,
+  USER, labels).
+- **--run-in=\<toolsimg\>** — the image whose environment is used to execute all
+  `RUN` instructions in this stage. It may contain tools, package managers, or
+  runtimes that are not present in the base image.
+- **--at=\<path\>** — the path inside the tools container where the base image's
+  filesystem is pre-populated before any `RUN` instruction runs. Tools that
+  accept an install root or chroot path (e.g. `dnf --installroot=<path>`,
+  `rpm --root=<path>`) can be pointed here to operate on the base image's
+  content rather than the tools container's own filesystem.
+
+At commit time the contents of `<path>` are merged into a fresh container based
+on the base image. No artifacts from the tools image appear in the final image.
+
+Both `--run-in` and `--at` are required when either is used.
+
+Because the base image's filesystem is pre-populated at `<path>` before any
+`RUN` instruction runs, tools that query an install database will see what is
+already present in the base image and operate on the true delta only.
+
+Example — install `jq` into a minimal image using its builder variant as the
+execution environment:
+
+```Dockerfile
+FROM registry.example.com/core-runtime:latest AS base
+FROM registry.example.com/core-runtime:latest-builder AS tools
+
+FROM --run-in=tools --at=/target base AS final
+USER 0
+RUN dnf install -y --installroot=/target --use-host-config \
+        --nodocs --setopt=install_weak_deps=False jq && \
+    dnf clean all --installroot=/target
+```
+
+The final image contains no package manager, no shell, and no other artifacts
+from the `tools` stage. Only the packages not already present in `base` are
+added as a new layer.
+
 ### Building an multi-architecture image using the --manifest option (requires emulation software)
 
 buildah build --arch arm --manifest myimage /tmp/mysrc

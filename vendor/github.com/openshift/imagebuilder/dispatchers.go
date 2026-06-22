@@ -370,9 +370,24 @@ func from(b *Builder, args []string, attributes map[string]bool, flagArgs []stri
 				return fmt.Errorf("no value specified for --after=")
 			}
 			b.After = afterStage
+		case strings.HasPrefix(arg, "--run-in="):
+			runIn := strings.TrimPrefix(arg, "--run-in=")
+			if runIn == "" {
+				return fmt.Errorf("no value specified for --run-in=")
+			}
+			b.RunIn = runIn
+		case strings.HasPrefix(arg, "--at="):
+			rootfs := strings.TrimPrefix(arg, "--at=")
+			if rootfs == "" {
+				return fmt.Errorf("no value specified for --at=")
+			}
+			b.RunAt = rootfs
 		default:
-			return fmt.Errorf("FROM only supports the --platform and --after flags")
+			return fmt.Errorf("FROM only supports the --platform, --after, --run-in, and --at flags")
 		}
+	}
+	if b.RunIn != "" && b.RunAt == "" {
+		return fmt.Errorf("--at= is required when --run-in= is specified")
 	}
 	b.RunConfig.Image = name
 	// TODO: handle onbuild

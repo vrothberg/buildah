@@ -934,6 +934,32 @@ func (b *executor) Build(ctx context.Context, stages imagebuilder.Stages) (image
 							}
 						}
 					}
+					// Parse --run-in=<stage> to register the tools image as a
+					// dependency, so skipUnusedStages won't discard it and the image
+					// isn't cleaned up before the stage that needs it runs.
+					for _, flag := range child.Flags {
+						runAsStage, ok := strings.CutPrefix(flag, "--run-in=")
+						if !ok {
+							continue
+						}
+						builtinArgs := argsMapToSlice(stage.Builder.BuiltinArgDefaults)
+						headingArgs := argsMapToSlice(stage.Builder.HeadingArgs)
+						userArgs := argsMapToSlice(stage.Builder.Args)
+						localScopeArgs := argsMapToSlice(stageLocalScopeArgs)
+						userArgs = slices.Concat(userArgs, localScopeArgs, headingArgs, builtinArgs)
+						runAsResolved, err := imagebuilder.ProcessWord(runAsStage, userArgs)
+						if err != nil {
+							return "", nil, fmt.Errorf("while replacing arg variables for --run-in=%q: %w", runAsStage, err)
+						}
+						b.baseMap[runAsResolved] = struct{}{}
+						if _, ok := b.additionalBuildContexts[runAsResolved]; !ok {
+							if _, ok := dependencyMap[runAsResolved]; ok {
+								currentStageInfo := dependencyMap[stage.Name]
+								currentStageInfo.Needs = append(currentStageInfo.Needs, runAsResolved)
+							}
+						}
+						logrus.Debugf("stage %d: tools image dependency %q via --run-in=", stageIndex, runAsResolved)
+					}
 					// Parse any --after= flag for explicit stage dependency
 					for _, flag := range child.Flags {
 						if after, ok := strings.CutPrefix(flag, "--after="); ok {

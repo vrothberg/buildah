@@ -84,6 +84,17 @@ type stageExecutor struct {
 	argsFromContainerfile []string
 	hasLink               bool
 	isLastStep            bool
+	// customizeBaseImage is set when the stage uses FROM --customize=with=<toolsimg>.
+	// It holds the resolved name/ID of the base image whose filesystem is pre-populated
+	// at customizeRootfs inside the tools container, and whose config is used for the
+	// final committed image.
+	customizeBaseImage string
+	// customizeRootfs is the path inside the tools container where the base image's
+	// filesystem is mounted (default "/target").
+	customizeRootfs string
+	// runInResolved is the resolved image ID of the --run-in=<toolsimg> stage,
+	// set in execute() after waitForStage completes, for use by prepare().
+	runInResolved string
 }
 
 // Preserve informs the stage executor that from this point on, it needs to
@@ -1077,9 +1088,24 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 	if err != nil {
 		return nil, fmt.Errorf("invalid base image specification %q: %w", from, err)
 	}
+
+	// Handle FROM <baseimg> --run-in=<toolsimg> --at=<path>.
+	// s.runInResolved is the resolved tools image set in execute().
+	var sanitizedRunIn string
+	customizeRootfs := ib.RunAt
+	if s.runInResolved != "" {
+		sanitizedRunIn, err = s.sanitizeFrom(s.runInResolved, tmpdir.GetTempDir())
+		if err != nil {
+			return nil, fmt.Errorf("invalid --run-in image %q: %w", ib.RunIn, err)
+		}
+	}
+
 	displayFrom := from
 	if ib.Platform != "" {
 		displayFrom = "--platform=" + ib.Platform + " " + displayFrom
+	}
+	if sanitizedRunIn != "" {
+		displayFrom = fmt.Sprintf("--run-in=%s --at=%s %s", ib.RunIn, customizeRootfs, displayFrom)
 	}
 
 	// stage.Name will be a numeric string for all stages without an "AS" clause
@@ -1114,9 +1140,15 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 		}
 	}
 
+	// When --run-in= is set, execute RUN instructions inside the tools image.
+	fromImageForExec := sanitizedFrom
+	if sanitizedRunIn != "" {
+		fromImageForExec = sanitizedRunIn
+	}
+
 	builderOptions := buildah.BuilderOptions{
 		Args:                  ib.Args,
-		FromImage:             sanitizedFrom,
+		FromImage:             fromImageForExec,
 		GroupAdd:              s.executor.groupAdd,
 		PullPolicy:            pullPolicy,
 		ContainerSuffix:       s.executor.containerSuffix,
@@ -1152,52 +1184,85 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 		return nil, fmt.Errorf("creating build container: %w", err)
 	}
 
+	// For FROM <baseimg> --run-in=<toolsimg>, seed the imagebuilder config from the
+	// BASE image so that ENV/CMD/EXPOSE etc. are inherited from what we're extending,
+	// not from the tools execution environment.
+	// Also create a container from the tools image to use as the execution environment.
+	var baseBuilder *buildah.Builder
+	if sanitizedRunIn != "" {
+		baseBuilderOptions := buildah.BuilderOptions{
+			Args:                ib.Args,
+			FromImage:           sanitizedFrom,
+			PullPolicy:          pullPolicy,
+			Registry:            s.executor.registry,
+			SignaturePolicyPath: s.executor.signaturePolicyPath,
+			SystemContext:       s.systemContext,
+			Isolation:           s.executor.isolation,
+			Format:              s.executor.outputFormat,
+			Logger:              s.executor.logger,
+		}
+		baseBuilder, err = buildah.NewBuilder(ctx, s.executor.store, baseBuilderOptions)
+		if err != nil {
+			if err2 := builder.Delete(); err2 != nil {
+				logrus.Debugf("error deleting tools container after base builder failure: %v", err2)
+			}
+			return nil, fmt.Errorf("creating base image container for --run-in: %w", err)
+		}
+	}
+
+	// configSource seeds ib.FromImage(): normally the execution builder, but with
+	// --run-in= we want the base image's config (CMD, ENV, USER, labels…).
+	configSource := builder
+	if baseBuilder != nil {
+		configSource = baseBuilder
+	}
+
 	if initializeIBConfig {
 		volumes := map[string]struct{}{}
-		for _, v := range builder.Volumes() {
+		for _, v := range configSource.Volumes() {
 			volumes[v] = struct{}{}
 		}
 		ports := map[docker.Port]struct{}{}
-		for _, p := range builder.Ports() {
+		for _, p := range configSource.Ports() {
 			ports[docker.Port(p)] = struct{}{}
 		}
-		hostname, domainname := builder.Hostname(), builder.Domainname()
-		containerName := builder.Container
+		hostname, domainname := configSource.Hostname(), configSource.Domainname()
+		containerName := configSource.Container
 		if s.executor.timestamp != nil || s.executor.sourceDateEpoch != nil {
 			hostname, domainname, containerName = "sandbox", "", ""
 		}
 		dConfig := docker.Config{
 			Hostname:     hostname,
 			Domainname:   domainname,
-			User:         builder.User(),
-			Env:          builder.Env(),
-			Cmd:          builder.Cmd(),
+			User:         configSource.User(),
+			Env:          configSource.Env(),
+			Cmd:          configSource.Cmd(),
 			Image:        from,
 			Volumes:      volumes,
-			WorkingDir:   builder.WorkDir(),
-			Entrypoint:   builder.Entrypoint(),
-			Healthcheck:  (*docker.HealthConfig)(builder.Healthcheck()),
-			Labels:       builder.Labels(),
-			Shell:        builder.Shell(),
-			StopSignal:   builder.StopSignal(),
-			OnBuild:      builder.OnBuild(),
+			WorkingDir:   configSource.WorkDir(),
+			Entrypoint:   configSource.Entrypoint(),
+			Healthcheck:  (*docker.HealthConfig)(configSource.Healthcheck()),
+			Labels:       configSource.Labels(),
+			Shell:        configSource.Shell(),
+			StopSignal:   configSource.StopSignal(),
+			OnBuild:      configSource.OnBuild(),
 			ExposedPorts: ports,
 		}
 		var rootfs *docker.RootFS
-		if builder.Docker.RootFS != nil {
+		if configSource.Docker.RootFS != nil {
 			rootfs = &docker.RootFS{
-				Type: builder.Docker.RootFS.Type,
+				Type: configSource.Docker.RootFS.Type,
 			}
-			for _, id := range builder.Docker.RootFS.DiffIDs {
+			for _, id := range configSource.Docker.RootFS.DiffIDs {
 				rootfs.Layers = append(rootfs.Layers, id.String())
 			}
 		}
 		dImage := docker.Image{
-			Parent:          builder.FromImageID,
+			Parent:          configSource.FromImageID,
 			ContainerConfig: dConfig,
 			Container:       containerName,
-			Author:          builder.Maintainer(),
-			Architecture:    builder.Architecture(),
+			Author:          configSource.Maintainer(),
+			Architecture:    configSource.Architecture(),
 			RootFS:          rootfs,
 		}
 		dImage.Config = &dImage.ContainerConfig
@@ -1208,6 +1273,11 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 		}
 		err = ib.FromImage(&dImage, node)
 		if err != nil {
+			if baseBuilder != nil {
+				if err2 := baseBuilder.Delete(); err2 != nil {
+					logrus.Debugf("error deleting base builder after ib.FromImage failure: %v", err2)
+				}
+			}
 			if err2 := builder.Delete(); err2 != nil {
 				logrus.Debugf("error deleting container which we failed to update: %v", err2)
 			}
@@ -1216,6 +1286,11 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 	}
 	mountPoint, err := builder.Mount(builder.MountLabel)
 	if err != nil {
+		if baseBuilder != nil {
+			if err2 := baseBuilder.Delete(); err2 != nil {
+				logrus.Debugf("error deleting base builder after mount failure: %v", err2)
+			}
+		}
 		if err2 := builder.Delete(); err2 != nil {
 			logrus.Debugf("error deleting container which we failed to mount: %v", err2)
 		}
@@ -1229,9 +1304,56 @@ func (s *stageExecutor) prepare(ctx context.Context, from string, initializeIBCo
 		s.volumes = make([]string, 0, len(s.volumes))
 		s.volumeCache = make(map[string]string)
 		s.volumeCacheInfo = make(map[string]os.FileInfo)
-		for _, v := range builder.Volumes() {
+		for _, v := range configSource.Volumes() {
 			if err := s.Preserve(v); err != nil {
 				return nil, fmt.Errorf("marking base image volume %q for preservation: %w", v, err)
+			}
+		}
+
+		// For FROM --customize: record what the base image is so that commit() can
+		// create the final image correctly. The target directory (/target) starts
+		// empty; RUN instructions install packages into it using --installroot.
+		// At commit time, commitCustomized() copies the /target tree into a fresh
+		// container based on the base image.
+		if baseBuilder != nil {
+			targetDir := filepath.Join(mountPoint, customizeRootfs)
+			if err := os.MkdirAll(targetDir, 0755); err != nil {
+				return nil, fmt.Errorf("creating --customize target dir %q: %w", targetDir, err)
+			}
+
+			// Copy the base image's filesystem into the rootfs directory so that
+			// package managers (e.g. dnf --installroot=/target) see what is already
+			// installed and only install the true delta.
+			if !s.executor.quiet {
+				s.log("Copying base image %s to %s", from, customizeRootfs)
+			}
+			baseMountPoint, err := baseBuilder.Mount(baseBuilder.MountLabel)
+			if err != nil {
+				return nil, fmt.Errorf("mounting base image for --customize: %w", err)
+			}
+			rc, err := chrootarchive.Tar("/", nil, baseMountPoint)
+			if err != nil {
+				return nil, fmt.Errorf("archiving base image for --customize: %w", err)
+			}
+			if err := chrootarchive.Untar(rc, targetDir, nil); err != nil {
+				rc.Close()
+				return nil, fmt.Errorf("populating --customize rootfs %q from base image: %w", targetDir, err)
+			}
+			rc.Close()
+			if err := baseBuilder.Unmount(); err != nil {
+				logrus.Debugf("unmounting base builder for --customize: %v", err)
+			}
+
+			// Record for commit(): the base image is what we commit on top of.
+			s.customizeBaseImage = sanitizedFrom
+			s.customizeRootfs = customizeRootfs
+
+			// The base builder is only needed for config reading (done above).
+			if err := baseBuilder.Unmount(); err != nil {
+				logrus.Debugf("unmounting base builder for --customize: %v", err)
+			}
+			if err := baseBuilder.Delete(); err != nil {
+				logrus.Debugf("deleting base builder for --customize: %v", err)
 			}
 		}
 	}
@@ -1322,6 +1444,34 @@ func (s *stageExecutor) execute(ctx context.Context, base string) (imgID string,
 		preserveBaseImageAnnotationsAtStageStart = true
 	}
 	s.executor.stagesLock.Unlock()
+
+	// If FROM <baseimg> --run-in=<toolsimg> was used, wait for the tools image
+	// stage to finish and resolve its name to an image ID.
+	// Must happen outside stagesLock to avoid deadlock.
+	if ib.RunIn != "" {
+		if isStage, err := s.executor.waitForStage(ctx, ib.RunIn, s.stages[:s.index]); isStage && err != nil {
+			return "", nil, false, fmt.Errorf("waiting for --run-in=%s: %w", ib.RunIn, err)
+		}
+		runIn := ib.RunIn
+		s.executor.stagesLock.Lock()
+		if stageImage, ok := s.executor.imageMap[runIn]; ok {
+			runIn = stageImage
+		} else {
+			for _, st := range s.stages {
+				if st.Name == runIn || strconv.Itoa(st.Position) == runIn {
+					fromImg, _ := st.Builder.From(st.Node)
+					if committed, ok := s.executor.imageMap[fromImg]; ok {
+						runIn = committed
+					} else {
+						runIn = fromImg
+					}
+					break
+				}
+			}
+		}
+		s.executor.stagesLock.Unlock()
+		s.runInResolved = runIn
+	}
 
 	// Set things up so that we can log resource usage as we go.
 	logRusage := func() {
@@ -2744,9 +2894,127 @@ func (s *stageExecutor) commit(ctx context.Context, createdBy string, emptyLayer
 			options.ForceCompressionFormat = s.executor.forceCompressionFormat
 		}
 	}
+	if s.customizeBaseImage != "" {
+		// FROM --customize was used: commit from the rootfs subpath rather than the
+		// full tools container, and use the base image as the starting point so that
+		// the layer history is correct and the final image is truly distroless.
+		imgID, results, err := s.commitCustomized(ctx, imageRef, options)
+		if err != nil {
+			return "", nil, err
+		}
+		return imgID, results, nil
+	}
+
 	results, err := s.builder.CommitResults(ctx, imageRef, options)
 	if err != nil {
 		return "", nil, err
+	}
+	return results.ImageID, results, nil
+}
+
+// commitCustomized handles the final image commit for stages that used FROM --customize.
+// It creates a new working container based on the original base image, copies the contents
+// of the rootfs subpath (e.g. /target) from the tools container into it, then commits that
+// container so the final image layers correctly on top of the base image.
+func (s *stageExecutor) commitCustomized(ctx context.Context, imageRef types.ImageReference, options buildah.CommitOptions) (string, *buildah.CommitResults, error) {
+	// Create a fresh container from the base image to get correct layer history.
+	finalBuilderOptions := buildah.BuilderOptions{
+		FromImage:           s.customizeBaseImage,
+		PullPolicy:          define.PullNever, // already pulled during prepare()
+		SignaturePolicyPath: s.executor.signaturePolicyPath,
+		SystemContext:       s.systemContext,
+		Isolation:           s.executor.isolation,
+		Format:              s.executor.outputFormat,
+		Logger:              s.executor.logger,
+	}
+	finalBuilder, err := buildah.NewBuilder(ctx, s.executor.store, finalBuilderOptions)
+	if err != nil {
+		return "", nil, fmt.Errorf("creating final image container for --customize commit: %w", err)
+	}
+	defer func() {
+		if err2 := finalBuilder.Delete(); err2 != nil {
+			logrus.Debugf("deleting final builder for --customize: %v", err2)
+		}
+	}()
+
+	finalMountPoint, err := finalBuilder.Mount(finalBuilder.MountLabel)
+	if err != nil {
+		return "", nil, fmt.Errorf("mounting final image container for --customize commit: %w", err)
+	}
+	defer func() {
+		if err2 := finalBuilder.Unmount(); err2 != nil {
+			logrus.Debugf("unmounting final builder for --customize: %v", err2)
+		}
+	}()
+
+	// Copy the full contents of the customizeRootfs directory (e.g. /target) from
+	// the tools container into the final container's rootfs.  RUN instructions
+	// will have installed packages there (e.g. via dnf --installroot=/target).
+	// We use targetDir as the Tar root so that archive entries are relative to
+	// the directory itself (e.g. "usr/bin/strace" not "target/usr/bin/strace").
+	targetDir := filepath.Join(s.mountPoint, s.customizeRootfs)
+	logrus.Debugf("--customize: copying %q (mount=%s rootfs=%s) into %q", targetDir, s.mountPoint, s.customizeRootfs, finalMountPoint)
+	entries, _ := os.ReadDir(targetDir)
+	logrus.Debugf("--customize: targetDir has %d top-level entries", len(entries))
+	rc, err := chrootarchive.Tar("/", nil, targetDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("archiving --customize rootfs %q: %w", targetDir, err)
+	}
+	if err := chrootarchive.Untar(rc, finalMountPoint, nil); err != nil {
+		rc.Close()
+		return "", nil, fmt.Errorf("extracting --customize rootfs into final container: %w", err)
+	}
+	rc.Close()
+
+	// Copy the accumulated image config (CMD, ENV, LABEL, etc.) from the tools
+	// builder to the final builder. These were already set on s.builder by commit()
+	// before calling commitCustomized.
+	finalBuilder.SetMaintainer(s.builder.Maintainer())
+	finalBuilder.SetCreatedBy(s.builder.CreatedBy())
+	finalBuilder.SetHostname(s.builder.Hostname())
+	finalBuilder.SetDomainname(s.builder.Domainname())
+	finalBuilder.SetUser(s.builder.User())
+	finalBuilder.ClearPorts()
+	for _, p := range s.builder.Ports() {
+		finalBuilder.SetPort(p)
+	}
+	finalBuilder.ClearEnv()
+	for _, e := range s.builder.Env() {
+		k, v, _ := strings.Cut(e, "=")
+		finalBuilder.SetEnv(k, v)
+	}
+	finalBuilder.SetCmd(s.builder.Cmd())
+	finalBuilder.ClearVolumes()
+	for _, v := range s.builder.Volumes() {
+		finalBuilder.AddVolume(v)
+	}
+	finalBuilder.ClearOnBuild()
+	for _, ob := range s.builder.OnBuild() {
+		finalBuilder.SetOnBuild(ob)
+	}
+	finalBuilder.SetWorkDir(s.builder.WorkDir())
+	finalBuilder.SetEntrypoint(s.builder.Entrypoint())
+	finalBuilder.SetShell(s.builder.Shell())
+	finalBuilder.SetStopSignal(s.builder.StopSignal())
+	finalBuilder.SetHealthcheck(s.builder.Healthcheck())
+	finalBuilder.ClearLabels()
+	for k, v := range s.builder.Labels() {
+		finalBuilder.SetLabel(k, v)
+	}
+	finalBuilder.ClearAnnotations()
+	for k, v := range s.builder.Annotations() {
+		finalBuilder.SetAnnotation(k, v)
+	}
+	if s.executor.architecture != "" {
+		finalBuilder.SetArchitecture(s.executor.architecture)
+	}
+	if s.executor.os != "" {
+		finalBuilder.SetOS(s.executor.os)
+	}
+
+	results, err := finalBuilder.CommitResults(ctx, imageRef, options)
+	if err != nil {
+		return "", nil, fmt.Errorf("committing --customize image: %w", err)
 	}
 	return results.ImageID, results, nil
 }
